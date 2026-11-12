@@ -1,0 +1,123 @@
+name: Build agent-custom (chphch)
+
+# Builds the macOS arm64 Happy Agent binary from this fork's agent-custom branch, unsigned by
+# Apple (ad-hoc signed only) and unpublished: the binary is a workflow artifact that the
+# macmini installs by hand. It mirrors release-happy-agent.yml's darwin-arm64 build job without
+# its signing, notarization and release steps.
+
+on:
+    workflow_dispatch:
+        inputs:
+            version:
+                description: Version the binary reports, e.g. 2026.11.6-chphch.1
+                required: true
+
+permissions:
+    contents: read
+
+jobs:
+    build:
+        name: Build darwin-arm64
+        runs-on: macos-15
+        timeout-minutes: 60
+        env:
+            TARGET: darwin-arm64
+            HAPPY_AGENT_RELEASE_VERSION: ${{ inputs.version }}
+        steps:
+            - name: Check out
+              uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+            - name: Set up pnpm
+              uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
+
+            - name: Set up Node.js
+              uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+              with:
+                  node-version: "24"
+                  package-manager-cache: false
+
+            - name: Install dependencies
+              run: pnpm install --frozen-lockfile --config.side-effects-cache=false
+
+            - name: Build Happy Agent JavaScript
+              run: |
+                  pnpm --filter @slopus/happy-agent-supervisor build
+                  pnpm --filter @slopus/happy-providers build
+                  pnpm --filter @slopus/happy-agent-compute build
+                  pnpm --filter @slopus/happy-agent-modules build
+                  pnpm --filter @slopus/happy-agent build
+
+            - name: Ad-hoc sign Tailcat before embedding
+              shell: bash
+              run: |
+                  # The one Tailcat release the repository ships, such as v0.7.0-happy.1. Upstream's
+                  # release workflow names it literally; reading it here keeps this build working
+                  # when upstream moves to another Tailcat release.
+                  versions=(packages/happy-agent/assets/tailcat/v*/)
+                  test "${#versions[@]}" = 1 || { echo "expected one Tailcat version folder, found: ${versions[*]}"; exit 1; }
+                  version="$(basename "${versions[0]}")"
+                  source="packages/happy-agent/assets/tailcat/$version/$TARGET/tailcat"
+                  signed="$GITHUB_WORKSPACE/packages/happy-agent/dist/vendor/tailcat-$version-$TARGET-signed"
+                  mkdir -p "$(dirname "$signed")"
+                  cp "$source" "$signed"
+                  codesign --force --identifier com.slopus.happy.agent.tailcat --sign - "$signed"
+                  test "$("$signed" version)" = "$version"
+                  printf 'HAPPY_AGENT_SIGNED_TAILCAT_PATH=%s\n' "$signed" >> "$GITHUB_ENV"
+
+            - name: Identify the native database build inputs
+              id: libsql-inputs
+              shell: bash
+              run: |
+                  toolchain="$(node -p 'JSON.parse(require("node:fs").readFileSync("packages/happy-agent/native/libsql/source.json")).toolchain')"
+                  rustup toolchain install "$toolchain" --profile minimal
+                  echo "key=$(node scripts/release/nativeLibsqlCacheKey.mjs)" >> "$GITHUB_OUTPUT"
+
+            - name: Restore the native database binding
+              id: libsql-cache
+              uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+              with:
+                  path: packages/happy-agent/native/target/darwin-arm64/libsql.node
+                  key: ${{ steps.libsql-inputs.outputs.key }}
+
+            - name: Build the pinned native database binding
+              if: steps.libsql-cache.outputs.cache-hit != 'true'
+              run: pnpm --filter @slopus/happy-agent build:native:libsql
+
+            - name: Cache the native database binding
+              if: steps.libsql-cache.outputs.cache-hit != 'true'
+              uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+              with:
+                  path: packages/happy-agent/native/target/darwin-arm64/libsql.node
+                  key: ${{ steps.libsql-inputs.outputs.key }}
+
+            - name: Build and verify the native Python worker
+              uses: ./.github/actions/build-monty
+
+            - name: Compile Happy Agent standalone binary
+              run: pnpm --filter @slopus/happy-agent build:bun --target "$TARGET"
+
+            - name: Ad-hoc sign Happy Agent
+              shell: bash
+              run: |
+                  binary="packages/happy-agent/dist/bin/happy-agent-$TARGET"
+                  codesign --force --identifier com.slopus.happy.agent --sign - \
+                      --entitlements packages/happy-agent/assets/macos/entitlements.plist "$binary"
+                  codesign --verify --strict --verbose=2 "$binary"
+
+            - name: Smoke test the binary
+              shell: bash
+              run: |
+                  binary="packages/happy-agent/dist/bin/happy-agent-$TARGET"
+                  test "$("$binary" --version)" = "Happy Agent $HAPPY_AGENT_RELEASE_VERSION"
+                  "$binary" --help >/dev/null
+                  export HAPPY_HOME_DIR="$(mktemp -d /tmp/happy-agent-smoke.XXXXXX)/home"
+                  "$binary" start
+                  "$binary" status
+                  "$binary" stop
+
+            - name: Upload the binary
+              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              with:
+                  name: happy-agent-darwin-arm64-${{ inputs.version }}
+                  path: packages/happy-agent/dist/bin/happy-agent-darwin-arm64
+                  retention-days: 30
