@@ -509,6 +509,8 @@ const MAX_TERMINAL_WIRE_MESSAGE_BYTES = 4 * 1024 * 1024 + 20;
 const MAX_ANNOUNCED_PENDING_MESSAGES = 10_000;
 const MAX_ANNOUNCED_AGENT_CREATIONS = 10_000;
 const MAX_ANNOUNCED_TERMINAL_RUNS = 10_000;
+/** Tries at announcing an agent's process count after its foreign background work changed. */
+const MAX_FOREIGN_WORK_ANNOUNCE_ATTEMPTS = 8;
 const MAX_ANNOUNCED_EXECUTION_CONFIGURATIONS = 512 * 64;
 const DRAIN_MUTATION_LOG_INTERVAL_MS = 5_000;
 /** How often a drain looks at what still holds it open; it logs only on change or every 5s. */
@@ -751,8 +753,11 @@ export class ApiModule implements AgentModule {
      * tasks live in the foreign agent's process, which ends with the daemon.
      */
     readonly #foreignBackgroundWork = new Map<string, number>();
-    /** Per agent, the latest announcement of its process count after its foreign work changed. */
-    readonly #foreignBackgroundWorkUpdates = new Map<string, Promise<void>>();
+    /**
+     * Per agent, the announcement of its process count that is pending or running, and whether a
+     * newer count arrived since it last read one.
+     */
+    readonly #foreignBackgroundWorkUpdates = new Map<string, { again: boolean }>();
     /** Per agent, the streamed assistant message being accumulated block by block. */
     readonly #streamingAssistantBlocks = new Map<
         string,
@@ -3532,39 +3537,57 @@ export class ApiModule implements AgentModule {
      * Take a foreign agent's new count of the background tasks it runs, and announce the agent's
      * process count. The count may arrive from inside the agent's own operation, mid-turn, where a
      * metadata update would wait on that operation, so the announcement runs from the module's
-     * background scope. Announcements for one agent run one after another, each reading the latest
-     * count, so the last one published is the count that stands.
+     * background scope. One announcement per agent is pending at a time and reads the latest count
+     * when it runs; a count that arrives after that read makes it announce once more. A burst of
+     * changes, such as a workflow starting many subagents, so costs a few updates, and the last one
+     * published is the count that stands. A failed update is retried a bounded number of times.
      */
     #adoptForeignBackgroundWork(ctx: Context, agentId: string, running: number): void {
         if (running === (this.#foreignBackgroundWork.get(agentId) ?? 0)) return;
         if (running > 0) this.#foreignBackgroundWork.set(agentId, running);
         else this.#foreignBackgroundWork.delete(agentId);
-        const previous = this.#foreignBackgroundWorkUpdates.get(agentId) ?? Promise.resolve();
+        const pending = this.#foreignBackgroundWorkUpdates.get(agentId);
+        if (pending !== undefined) {
+            pending.again = true;
+            return;
+        }
+        const entry = { again: true };
+        this.#foreignBackgroundWorkUpdates.set(agentId, entry);
         const task = this.#backgroundScope.runInAsyncScope(async () => {
-            await previous;
-            await new Promise<void>((resolve) => setImmediate(resolve));
-            if (this.#closed) return;
+            let attempts = 0;
             try {
-                const processes = await this.#compute.listProcesses(ctx, agentId);
-                await this.#updateAgentMetadata(ctx, agentId, {
-                    processes: { running: this.#runningProcessCount(agentId, processes) },
-                });
-            } catch (error: unknown) {
-                ctx.log.warn(
-                    "The API could not announce a foreign agent's background work.",
-                    { agentId },
-                    error,
-                );
-            }
-        });
-        this.#foreignBackgroundWorkUpdates.set(agentId, task);
-        this.#backgroundMetadataUpdates.add(task);
-        void task.finally(() => {
-            this.#backgroundMetadataUpdates.delete(task);
-            if (this.#foreignBackgroundWorkUpdates.get(agentId) === task) {
+                while (entry.again && attempts < MAX_FOREIGN_WORK_ANNOUNCE_ATTEMPTS) {
+                    await new Promise<void>((resolve) => setImmediate(resolve));
+                    if (this.#closed) return;
+                    // The read below sees every count that has arrived so far, so only a later
+                    // one needs another announcement.
+                    entry.again = false;
+                    try {
+                        const processes = await this.#compute.listProcesses(ctx, agentId);
+                        await this.#updateAgentMetadata(ctx, agentId, {
+                            processes: { running: this.#runningProcessCount(agentId, processes) },
+                        });
+                        attempts = 0;
+                    } catch (error: unknown) {
+                        // An agent deleted meanwhile has nothing left to announce.
+                        if (error instanceof ApiError && error.code === "not_found") return;
+                        attempts += 1;
+                        entry.again = true;
+                        if (attempts === MAX_FOREIGN_WORK_ANNOUNCE_ATTEMPTS) {
+                            ctx.log.warn(
+                                "The API could not announce a foreign agent's background work.",
+                                { agentId },
+                                error,
+                            );
+                        }
+                    }
+                }
+            } finally {
                 this.#foreignBackgroundWorkUpdates.delete(agentId);
             }
         });
+        this.#backgroundMetadataUpdates.add(task);
+        void task.finally(() => this.#backgroundMetadataUpdates.delete(task));
     }
 
     async #convertProjectEvent(ctx: Context, event: ProjectEvent): Promise<void> {
