@@ -513,6 +513,7 @@ async function createFixture(tracing = false) {
         passive as never,
         {
             onDefaultModelChanged: () => () => undefined,
+            onForeignAgentBackgroundWork: () => () => undefined,
             onProviderServiceTiersChanged: (listener: () => void) => {
                 serviceTierListeners.add(listener);
                 return () => {
