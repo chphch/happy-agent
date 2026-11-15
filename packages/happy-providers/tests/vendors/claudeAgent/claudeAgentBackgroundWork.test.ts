@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createRootContext, withLifetime } from "@steve.kite/stdlib";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 import type { SessionMessage } from "@/core/SessionContext.js";
 import type { SessionEvent } from "@/core/SessionEvent.js";
@@ -15,10 +15,17 @@ import { claudeAgentConnect } from "@/vendors/claudeAgent/claudeAgentConnect.js"
  * Claude Code's own stream as the Agent SDK delivers it, measured on SDK 0.3.321 with Claude Code
  * 2.1.321: `system/background_tasks_changed` lists every live background task whenever that set
  * changes — a background command and a subagent join it while the turn that started them runs,
- * and leave it as they finish, after that turn's result.
+ * and leave it as they finish, after that turn's result. `script` picks how a query goes on after
+ * the tasks start: they finish one by one (`finish`), the Claude Code process ends with them
+ * (`exit`), or the turn never reaches its result until it is stopped from outside (`hold`).
  */
 const sdk = vi.hoisted(() => {
-    const state = { finish: (): void => undefined };
+    const state = {
+        script: "finish" as "finish" | "exit" | "hold",
+        finish: (): void => undefined,
+        closed: 0,
+        ended: false,
+    };
     const shell = {
         task_id: "bv74hfa93",
         task_type: "local_bash",
@@ -42,6 +49,7 @@ const sdk = vi.hoisted(() => {
         tasks,
     });
     function query(params: { prompt: AsyncIterable<unknown> }) {
+        const script = state.script;
         async function* messages() {
             const input = params.prompt[Symbol.asyncIterator]();
             await input.next();
@@ -57,6 +65,7 @@ const sdk = vi.hoisted(() => {
             };
             yield changed([shell]);
             yield changed([shell, subagent, watcher]);
+            if (script === "hold") await new Promise<void>(() => undefined);
             yield {
                 type: "result",
                 subtype: "success",
@@ -69,11 +78,13 @@ const sdk = vi.hoisted(() => {
                     cache_creation_input_tokens: 0,
                 },
             };
+            if (script === "exit") return;
             await new Promise<void>((resolve) => (state.finish = resolve));
             yield changed([subagent, watcher]);
             yield changed([subagent, watcher]);
             yield changed([watcher]);
             await input.next();
+            state.ended = true;
         }
         const iterator = messages();
         return Object.assign(iterator, {
@@ -82,7 +93,9 @@ const sdk = vi.hoisted(() => {
             applyFlagSettings: async () => undefined,
             setPermissionMode: async () => undefined,
             interrupt: async () => undefined,
-            close: () => undefined,
+            close: () => {
+                state.closed++;
+            },
         });
     }
     return { state, query };
@@ -91,14 +104,24 @@ const sdk = vi.hoisted(() => {
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({ query: sdk.query }));
 
 const open: AcpSession[] = [];
+beforeEach(() => {
+    sdk.state.script = "finish";
+    sdk.state.closed = 0;
+    sdk.state.ended = false;
+});
 afterEach(() => {
     for (const session of open.splice(0)) session.destroy();
+});
+
+const userMessage = (text: string): SessionMessage => ({
+    role: "user",
+    content: [{ type: "text", text }],
 });
 
 /** A Claude Code session whose turn environment records each background-work report. */
 async function sessionReporting(reports: number[]): Promise<{
     readonly session: AcpSession;
-    readonly run: () => Promise<SessionEvent[]>;
+    readonly run: (messages?: SessionMessage[], lifetime?: AbortSignal) => Promise<SessionEvent[]>;
 }> {
     const directory = mkdtempSync(join(tmpdir(), "claude-background-work-"));
     const provider = new AcpProvider({
@@ -112,12 +135,13 @@ async function sessionReporting(reports: number[]): Promise<{
     });
     const session = await provider.session("agent-1", { instructions: "Be Happy.", tools: [] });
     open.push(session);
-    const messages: SessionMessage[] = [
-        { role: "user", content: [{ type: "text", text: "Start both in the background." }] },
-    ];
-    const run = async (): Promise<SessionEvent[]> => {
+    const conversation = [userMessage("Start both in the background.")];
+    const run = async (
+        messages: SessionMessage[] = conversation,
+        lifetime: AbortSignal = new AbortController().signal,
+    ): Promise<SessionEvent[]> => {
         const events: SessionEvent[] = [];
-        const ctx = withLifetime(createRootContext().named("test"), new AbortController().signal);
+        const ctx = withLifetime(createRootContext().named("test"), lifetime);
         for await (const event of session.run(ctx, {
             context: { instructions: "Be Happy.", messages },
         })) {
@@ -127,14 +151,6 @@ async function sessionReporting(reports: number[]): Promise<{
         return events;
     };
     return { session, run };
-}
-
-async function until(check: () => boolean, what: string): Promise<void> {
-    const deadline = Date.now() + 5_000;
-    while (!check()) {
-        if (Date.now() > deadline) throw new Error(`Timed out waiting for ${what}.`);
-        await new Promise((resolve) => setTimeout(resolve, 10));
-    }
 }
 
 it("reports Claude Code's background tasks while they outlive the turn that started them", async () => {
@@ -147,7 +163,7 @@ it("reports Claude Code's background tasks while they outlive the turn that star
     expect(reports).toEqual([1, 2]);
 
     sdk.state.finish();
-    await until(() => reports.at(-1) === 0, "the last background task to end");
+    await vi.waitFor(() => expect(reports.at(-1)).toBe(0));
     // An unchanged set reports nothing new, and a set holding only ambient tasks is no work.
     expect(reports).toEqual([1, 2, 1, 0]);
 }, 30_000);
@@ -162,4 +178,48 @@ it("reports no background work once the session that ran it is gone", async () =
     // Closing the session ends the Claude Code process, and its background tasks with it.
     session.destroy();
     expect(reports).toEqual([1, 2, 0]);
+
+    // Counts Claude Code sent before it ended still arrive, and change nothing.
+    sdk.state.finish();
+    await vi.waitFor(() => expect(sdk.state.ended).toBe(true));
+    expect(reports).toEqual([1, 2, 0]);
+}, 30_000);
+
+it("reports no background work once Claude Code's process ends", async () => {
+    sdk.state.script = "exit";
+    const reports: number[] = [];
+    const { run } = await sessionReporting(reports);
+
+    await run();
+    await vi.waitFor(() => expect(reports).toEqual([1, 2, 0]));
+}, 30_000);
+
+it("reports no background work once a turn is stopped, which ends Claude Code", async () => {
+    sdk.state.script = "hold";
+    const reports: number[] = [];
+    const { run } = await sessionReporting(reports);
+    const stop = new AbortController();
+
+    const turn = run(undefined, stop.signal);
+    await vi.waitFor(() => expect(reports).toEqual([1, 2]));
+    stop.abort();
+
+    expect((await turn).at(-1)).toMatchObject({ type: "done", state: "cancelled" });
+    expect(reports).toEqual([1, 2, 0]);
+}, 30_000);
+
+it("ends a session the conversation moved away from, and stops counting its work", async () => {
+    const reports: number[] = [];
+    const { run } = await sessionReporting(reports);
+
+    await run();
+    expect(reports).toEqual([1, 2]);
+
+    // A transcript the open session never saw makes the next run open a new Claude Code session.
+    await run([userMessage("Something else entirely.")]);
+
+    // The first session's process is closed rather than left running where nobody sees it, and
+    // its count drops before the new session reports its own.
+    expect(sdk.state.closed).toBe(1);
+    expect(reports.slice(0, 3)).toEqual([1, 2, 0]);
 }, 30_000);

@@ -637,12 +637,20 @@ export class AcpSession extends BaseSession {
     /**
      * Tell the turn environment how many background tasks the foreign session runs now, once per
      * change. It may arrive between turns, so it goes to the environment of the latest run, as a
-     * wake does.
+     * wake does. It is bookkeeping beside the session, so a reporter that throws never breaks the
+     * session change or the exit it is reported from.
      */
     #reportBackgroundWork(running: number): void {
+        // A destroyed session runs nothing. A count still on its way from it would bring back
+        // work that ended with it, and nothing would report the end again.
+        if (this.#destroyed && running !== 0) return;
         if (running === this.#backgroundWork) return;
         this.#backgroundWork = running;
-        this.#environment?.backgroundWork?.(running);
+        try {
+            this.#environment?.backgroundWork?.(running);
+        } catch {
+            // A count that could not be reported is replaced by the next one.
+        }
     }
 
     /** Whether the foreign session has already been given every input in `messages`. */
