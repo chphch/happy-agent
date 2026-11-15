@@ -298,7 +298,15 @@ class ClaudeAgentConnection implements AcpAgentConnection {
             effort: undefined,
             mode: "default",
         };
-        this.#threads.get(sessionId)?.query.close();
+        // The client has moved to this session, so every other session of this connection is
+        // abandoned: its Claude Code process ends here, with whatever it still runs in the
+        // background, instead of running on where nobody sees it. Out of the map first, so its pump
+        // does not take that ending for the end of the whole connection.
+        for (const [id, other] of this.#threads) {
+            this.#threads.delete(id);
+            other.input.close();
+            other.query.close();
+        }
         this.#threads.set(sessionId, thread);
         void this.#pump(sessionId, thread);
         return thread;
