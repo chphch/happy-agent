@@ -1773,6 +1773,7 @@ describe("Foreign harness live transcript visibility", () => {
             passive as never,
             {
                 onDefaultModelChanged: subscribe,
+                onForeignAgentBackgroundWork: subscribe,
                 onProviderServiceTiersChanged: subscribe,
                 configuration: {
                     paths: { tokenPath: join(directory, "token"), agentHome: directory },

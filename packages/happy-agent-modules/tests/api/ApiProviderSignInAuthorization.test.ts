@@ -61,6 +61,7 @@ it("lets team members read an account's sign-in but only the owner change it", a
         passive,
         {
             onDefaultModelChanged: subscribe,
+            onForeignAgentBackgroundWork: subscribe,
             onProviderServiceTiersChanged: subscribe,
             configuration: {
                 paths: { tokenPath: join(directory, "token") },
