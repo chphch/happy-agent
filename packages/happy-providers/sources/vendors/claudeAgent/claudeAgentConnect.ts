@@ -17,6 +17,7 @@ import {
 import type { ProviderUsage } from "@/core/ProviderUsage.js";
 import {
     ACP_APPROVED_TOOLS_META,
+    ACP_BACKGROUND_WORK,
     ACP_BRIDGED_CALL_META,
     ACP_TURN_ENDED,
     ACP_TURN_STARTED,
@@ -398,13 +399,16 @@ class ClaudeAgentConnection implements AcpAgentConnection {
     /**
      * Translate one query's messages into ACP updates and end each turn at its result. Claude Code
      * also starts turns by itself, as when a background command finishes: such a turn is
-     * announced to the client before its first update and ended at its own result.
+     * announced to the client before its first update and ended at its own result. Whenever the
+     * set of background tasks it keeps running changes, the client is told how many there are.
      */
     async #pump(sessionId: string, thread: ClaudeThread): Promise<void> {
         const updates = claudeAgentUpdates();
         // The context is the prompt of the last main-thread API call, cache included. The result
         // sums every call of the turn and counts only uncached input.
         let context = 0;
+        // Background tasks are per Claude Code process, and a new process starts with none.
+        let background = 0;
         try {
             for await (const message of thread.query as AsyncIterable<SDKMessage>) {
                 if (
@@ -424,6 +428,22 @@ class ClaudeAgentConnection implements AcpAgentConnection {
                         providerId: "claude",
                     });
                     if (usage !== null) this.#onAccountUsage?.(usage);
+                }
+                if (message.type === "system" && message.subtype === "background_tasks_changed") {
+                    // Every live task, not a change, so a missed message cannot leave one counted.
+                    // Ambient tasks, such as watchers Claude Code starts itself, are not activity.
+                    const running = message.tasks.filter((task) => task.ambient !== true).length;
+                    if (running !== background) {
+                        background = running;
+                        // Bookkeeping beside the turn: a client that fails it never ends the query.
+                        await Promise.resolve(
+                            this.#client.extNotification?.(ACP_BACKGROUND_WORK, {
+                                sessionId,
+                                running,
+                            }),
+                        ).catch(() => undefined);
+                    }
+                    continue;
                 }
                 if (thread.turn === undefined && beginsTurn(message)) {
                     thread.turn = { prompt: undefined, cancelled: false, selfStarted: true };

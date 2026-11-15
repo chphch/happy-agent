@@ -6992,7 +6992,13 @@ Fields:
   are running right now (`running`). Changes to either count are `agent.updated` events. The
   subagents themselves are listed by `GET /v0/agents/:agentId/activity`.
 - `processes` — how many background processes started by this agent are running right now.
-  Process lifecycle detail travels in the `process.*` events and the activity endpoint.
+  Process lifecycle detail travels in the `process.*` events and the activity endpoint. For an
+  agent whose turns run in a foreign harness that reports the work it keeps running, such as
+  Claude Code, the count also includes that harness's own background tasks: its background
+  commands, monitors, subagents and workflows still running after the turn that started them.
+  Those tasks have no process objects, so they appear in neither the `process.*` events nor the
+  activity endpoint; a change to their number is an `agent.updated` event like any other change
+  to this count.
 - `pendingQuestionId` — the ID of the open question when the run is waiting on the person, or
   `null`. See "Questions" below.
 - `unread` — set when the agent finished work the user has not looked at: why (`reason`) and
