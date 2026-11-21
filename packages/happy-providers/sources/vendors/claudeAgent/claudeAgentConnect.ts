@@ -21,7 +21,11 @@ import {
     type AcpAgentConnection,
     type AcpConnect,
     type AcpConnection,
+    type AcpSideQuestion,
+    type AcpSideQuestionAnswer,
+    type AcpSideQuestionTurn,
 } from "@/protocol/acp/AcpConnection.js";
+import type { AcpStoredSideQuestion } from "@/protocol/acp/AcpProvider.js";
 import { ACP_BRIDGE_NAME } from "@/protocol/acp/impl/acpResponseEvents.js";
 import { processTreeGroups, terminateProcessTree } from "@/protocol/acp/impl/processTree.js";
 import { CLAUDE_SDK_PRIVACY_ENVIRONMENT } from "@/vendors/claude/claudeSdkPrivacyEnvironment.js";
@@ -180,6 +184,15 @@ class ClaudeAgentConnection implements AcpAgentConnection {
         if (thread?.turn === undefined) return;
         thread.turn.cancelled = true;
         await thread.query.interrupt().catch(() => undefined);
+    }
+
+    async askSideQuestion(
+        params: AcpSideQuestion & { readonly sessionId: string },
+    ): Promise<AcpSideQuestionAnswer | undefined> {
+        const thread = this.#threads.get(params.sessionId);
+        if (thread === undefined) return undefined;
+        // Answered beside the turn, with no input to the conversation: the turn is not touched.
+        return await claudeSideQuestion(thread.query, params);
     }
 
     stderr(): string {
@@ -468,6 +481,131 @@ class ClaudeAgentConnection implements AcpAgentConnection {
             },
         ] as acp.SessionConfigOption[];
     }
+}
+
+/**
+ * `Query.askSideQuestion`. The SDK ships it and Claude Code serves it as its `side_question`
+ * control request, even while a turn runs, but the SDK's public types leave it out (checked
+ * through 0.3.321).
+ */
+type SideQuestionQuery = Query & {
+    readonly askSideQuestion?: (
+        question: string,
+        options: { readonly history?: AcpSideQuestionTurn[]; readonly signal?: AbortSignal },
+    ) => Promise<{ readonly response: string | null; readonly synthetic?: boolean } | null>;
+};
+
+/** Claude Code's answer to a side question about the conversation `sdk` holds. */
+async function claudeSideQuestion(
+    sdk: Query,
+    question: AcpSideQuestion,
+): Promise<AcpSideQuestionAnswer> {
+    const ask = (sdk as SideQuestionQuery).askSideQuestion;
+    if (typeof ask !== "function") {
+        throw new Error("This version of Claude Code cannot answer side questions.");
+    }
+    const answer = await ask.call(sdk, question.question, {
+        history: question.history.map((turn) => ({
+            question: turn.question,
+            response: turn.response,
+        })),
+        signal: question.signal,
+    });
+    return { response: answer?.response ?? null, synthetic: answer?.synthetic === true };
+}
+
+/**
+ * Answer a side question about a stored Claude Code session that no process here runs.
+ *
+ * A separate Claude Code resumes the session as a fork that is never written to disk, so the
+ * session itself is neither continued nor changed; it gets the session's model and effort as a
+ * turn would, answers once, and ends. It starts no MCP servers and runs none of the person's
+ * hooks: a side question uses no tools, and those hooks belong to the person's own sessions.
+ */
+export async function claudeAgentStoredSideQuestion(
+    environment: NodeJS.ProcessEnv,
+    question: AcpStoredSideQuestion,
+    onAccountUsage?: (usage: ProviderUsage) => void,
+): Promise<AcpSideQuestionAnswer> {
+    const input = new AsyncInputQueue<SDKUserMessage>();
+    const children = new Set<ChildProcess>();
+    let stderr = "";
+    const sdk = query({
+        // Claude Code ends once its input does, so the input stays open until the answer is in.
+        prompt: input,
+        options: {
+            cwd: question.cwd,
+            resume: question.sessionId,
+            forkSession: true,
+            persistSession: false,
+            strictMcpConfig: true,
+            settingSources: ["user", "project", "local"],
+            settings: { disableAllHooks: true },
+            systemPrompt: { type: "preset", preset: "claude_code" },
+            pathToClaudeCodeExecutable: resolveClaudeCodeExecutablePath(),
+            env: {
+                ...process.env,
+                ...environment,
+                ...CLAUDE_CODE_PRIVACY_ENVIRONMENT,
+            },
+            stderr: (data) => {
+                stderr = (stderr + data).slice(-4000);
+            },
+            spawnClaudeCodeProcess: (options) => {
+                const child = spawnClaudeCodeChild(options, {
+                    detached: process.platform !== "win32",
+                    onStderr: (chunk) => {
+                        stderr = (stderr + chunk).slice(-4000);
+                    },
+                });
+                children.add(child);
+                child.once("exit", () => children.delete(child));
+                return child;
+            },
+        },
+    });
+    // Its messages must be read for its answers to arrive; of them only account limits matter.
+    void (async () => {
+        for await (const message of sdk as AsyncIterable<SDKMessage>) {
+            if (message.type !== "rate_limit_event") continue;
+            const usage = claudeUsageFromRateLimitInfo(message.rate_limit_info, {
+                capturedAt: Date.now(),
+                providerId: "claude",
+            });
+            if (usage !== null) onAccountUsage?.(usage);
+        }
+    })().catch(() => undefined);
+    try {
+        for (const option of question.options) {
+            if (option.configId === "model") await sdk.setModel(String(option.value));
+            if (option.configId === "effort") {
+                await sdk.applyFlagSettings({ effortLevel: String(option.value) } as never);
+            }
+        }
+        return await claudeSideQuestion(sdk, question);
+    } catch (error) {
+        // Claude Code's own output stays out of the message: it can name paths and variables, and
+        // the message is shown to people.
+        if (question.signal.aborted || !/exited|terminated|ended/i.test(errorMessage(error))) {
+            throw error;
+        }
+        throw new Error(
+            stderr.includes("No conversation found")
+                ? "Claude Code no longer has this conversation."
+                : "Claude Code stopped before it answered.",
+        );
+    } finally {
+        input.close();
+        sdk.close();
+        // Claude Code may be renewing the sign-in it shares with every other session.
+        for (const child of children) {
+            afterClaudeCodeRenewal(child, () => terminateProcessTree(child, []));
+        }
+    }
+}
+
+function errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
 }
 
 function sdkMcpServer(server: acp.McpServer): [string, never] {
