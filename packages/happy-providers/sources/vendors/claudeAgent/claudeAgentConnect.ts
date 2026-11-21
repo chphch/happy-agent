@@ -221,7 +221,12 @@ class ClaudeAgentConnection implements AcpAgentConnection {
         const thread = this.#threads.get(params.sessionId);
         if (thread === undefined) return undefined;
         // Answered beside the turn, with no input to the conversation: the turn is not touched.
-        return await claudeSideQuestion(thread.query, params);
+        try {
+            return await claudeSideQuestion(thread.query, params);
+        } catch (error) {
+            // The connection's stderr also holds earlier turns' output, so only the error counts.
+            throw params.signal.aborted ? error : sideQuestionFailure(error, "");
+        }
     }
 
     stderr(): string {
@@ -581,6 +586,9 @@ type SideQuestionQuery = Query & {
     ) => Promise<{ readonly response: string | null; readonly synthetic?: boolean } | null>;
 };
 
+/** Why a side question got no answer, already in a sentence a person can act on. */
+class SideQuestionFailure extends Error {}
+
 /** Claude Code's answer to a side question about the conversation `sdk` holds. */
 async function claudeSideQuestion(
     sdk: Query,
@@ -588,7 +596,7 @@ async function claudeSideQuestion(
 ): Promise<AcpSideQuestionAnswer> {
     const ask = (sdk as SideQuestionQuery).askSideQuestion;
     if (typeof ask !== "function") {
-        throw new Error("This version of Claude Code cannot answer side questions.");
+        throw new SideQuestionFailure("This version of Claude Code cannot answer side questions.");
     }
     const answer = await ask.call(sdk, question.question, {
         history: question.history.map((turn) => ({
@@ -613,6 +621,7 @@ export async function claudeAgentStoredSideQuestion(
     question: AcpStoredSideQuestion,
     onAccountUsage?: (usage: ProviderUsage) => void,
 ): Promise<AcpSideQuestionAnswer> {
+    if (question.signal.aborted) throw new Error("The side question was stopped.");
     const input = new AsyncInputQueue<SDKUserMessage>();
     const children = new Set<ChildProcess>();
     let stderr = "";
@@ -661,6 +670,9 @@ export async function claudeAgentStoredSideQuestion(
             if (usage !== null) onAccountUsage?.(usage);
         }
     })().catch(() => undefined);
+    // Stopping the question ends Claude Code at once, also while it is still starting up.
+    const stop = (): void => sdk.close();
+    question.signal.addEventListener("abort", stop, { once: true });
     try {
         for (const option of question.options) {
             if (option.configId === "model") await sdk.setModel(String(option.value));
@@ -670,17 +682,9 @@ export async function claudeAgentStoredSideQuestion(
         }
         return await claudeSideQuestion(sdk, question);
     } catch (error) {
-        // Claude Code's own output stays out of the message: it can name paths and variables, and
-        // the message is shown to people.
-        if (question.signal.aborted || !/exited|terminated|ended/i.test(errorMessage(error))) {
-            throw error;
-        }
-        throw new Error(
-            stderr.includes("No conversation found")
-                ? "Claude Code no longer has this conversation."
-                : "Claude Code stopped before it answered.",
-        );
+        throw question.signal.aborted ? error : sideQuestionFailure(error, stderr);
     } finally {
+        question.signal.removeEventListener("abort", stop);
         input.close();
         sdk.close();
         // Claude Code may be renewing the sign-in it shares with every other session.
@@ -688,6 +692,27 @@ export async function claudeAgentStoredSideQuestion(
             afterClaudeCodeRenewal(child, () => terminateProcessTree(child, []));
         }
     }
+}
+
+/**
+ * Why Claude Code gave no answer to a side question, in a sentence a person can act on. Its own
+ * words can name paths and variables, so they travel only as the error's `cause`, for logs.
+ */
+function sideQuestionFailure(error: unknown, stderr: string): Error {
+    if (error instanceof SideQuestionFailure) return error;
+    const text = `${errorMessage(error)}\n${stderr}`;
+    const reason = /rate.?limit|usage limit|\b429\b/i.test(text)
+        ? "Claude Code hit a usage limit. Try again once it resets."
+        : /overloaded|\b529\b/i.test(text)
+          ? "Claude is overloaded right now. Try again in a moment."
+          : /not logged in|\/login|authenticat|\b401\b|invalid api key/i.test(text)
+            ? "Claude Code isn't signed in, or its sign-in expired."
+            : /no conversation found/i.test(text)
+              ? "Claude Code no longer has this conversation."
+              : /exited|terminated|ended|closed/i.test(text)
+                ? "Claude Code stopped before it answered."
+                : "Claude Code could not answer this side question.";
+    return new SideQuestionFailure(reason, { cause: error });
 }
 
 function errorMessage(error: unknown): string {
