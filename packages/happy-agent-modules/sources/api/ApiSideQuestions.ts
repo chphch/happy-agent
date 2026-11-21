@@ -41,9 +41,10 @@ interface Question {
  *
  * Answering can take longer than one request may wait, so a question is asked once and collected
  * with as many requests as it needs, each waiting at most 20 seconds. A question is forgotten once
- * a response carries its answer or failure, when it is cancelled, and when nobody has collected it
- * within 10 minutes of being asked, which also stops its answer. So only the questions of the last
- * ten minutes are held, and only in memory: they end with the daemon.
+ * a response carrying its answer or failure has been sent in full (`collected`), when it is
+ * cancelled, and when nobody has collected it within 10 minutes of being asked, which also stops
+ * its answer. A response whose connection failed leaves the answer for the next request. So only
+ * the questions of the last ten minutes are held, and only in memory: they end with the daemon.
  */
 export class ApiSideQuestions {
     readonly #questions = new Map<string, Question>();
@@ -92,6 +93,11 @@ export class ApiSideQuestions {
         return true;
     }
 
+    /** A response carrying the question's answer or failure was sent in full: forget it. */
+    collected(agentId: string, owner: string | undefined, id: string): void {
+        if (this.#find(agentId, owner, id) !== undefined) this.#forget(id, false);
+    }
+
     #find(agentId: string, owner: string | undefined, id: string): Question | undefined {
         const question = this.#questions.get(id);
         return question?.agentId === agentId && question.owner === owner ? question : undefined;
@@ -107,11 +113,13 @@ export class ApiSideQuestions {
                 timer = setTimeout(() => resolve(undefined), this.#waitMs);
             }),
         ]).finally(() => clearTimeout(timer));
-        if (outcome === undefined) return { id, status: "answering" };
         // Cancelled, expired, or collected by another request meanwhile.
         if (this.#questions.get(id) !== question) return undefined;
-        this.#forget(id, false);
-        if ("refusal" in outcome) throw outcome.refusal;
+        if (outcome === undefined) return { id, status: "answering" };
+        if ("refusal" in outcome) {
+            this.#forget(id, false);
+            throw outcome.refusal;
+        }
         if ("error" in outcome) return { id, status: "failed", error: outcome.error };
         return {
             id,
