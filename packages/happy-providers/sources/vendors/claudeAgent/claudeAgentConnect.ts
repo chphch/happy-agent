@@ -691,22 +691,17 @@ export async function claudeAgentStoredSideQuestion(
 
 /**
  * Why Claude Code gave no answer to a side question, in a sentence a person can act on. Its own
- * words can name paths and variables, so they travel only as the error's `cause`, for logs.
+ * words can name paths and variables, so they travel only as the error's `cause`, for logs. An API
+ * error is not one of these: Claude Code answers it with a canned reply that says so (`synthetic`).
  */
 function sideQuestionFailure(error: unknown, stderr: string): Error {
     if (error instanceof SideQuestionFailure) return error;
     const text = `${errorMessage(error)}\n${stderr}`;
-    const reason = /rate.?limit|usage limit|\b429\b/i.test(text)
-        ? "Claude Code hit a usage limit. Try again once it resets."
-        : /overloaded|\b529\b/i.test(text)
-          ? "Claude is overloaded right now. Try again in a moment."
-          : /not logged in|\/login|authenticat|\b401\b|invalid api key/i.test(text)
-            ? "Claude Code isn't signed in, or its sign-in expired."
-            : /no conversation found/i.test(text)
-              ? "Claude Code no longer has this conversation."
-              : /exited|terminated|ended|closed/i.test(text)
-                ? "Claude Code stopped before it answered."
-                : "Claude Code could not answer this side question.";
+    const reason = /no conversation found/i.test(text)
+        ? "Claude Code no longer has this conversation."
+        : /exited|terminated|ended|closed/i.test(text)
+          ? "Claude Code stopped before it answered."
+          : "Claude Code could not answer this side question.";
     return new SideQuestionFailure(reason, { cause: error });
 }
 

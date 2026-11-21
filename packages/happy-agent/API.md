@@ -7755,11 +7755,15 @@ the harness that the agent's mode selects, the mode `GET /v0/agents/:agentId/mod
 that harness is running the conversation, it answers there. When it is not, as after the daemon
 restarted or the agent's turn was stopped, the daemon starts a separate copy of the harness that
 opens the conversation without continuing or changing it, answers from it, and ends; that answer
-takes longer.
+takes longer. After a compaction, until the next turn, that copy answers from the conversation as
+it stood before the compaction. Stopping the turn stops the running harness, so a side question it
+is still answering then fails; asked again, it goes to a separate copy.
 
 Answering can take longer than one request may wait, so a side question is asked with one request
 and collected with as many more as it needs. Each waits at most 20 seconds. The daemon keeps no
-side thread: a client that shows one sends the earlier exchanges with each new question.
+side thread: a client that shows one sends the earlier exchanges with each new question. A side
+question belongs to the team member who asked it: only they can collect or cancel it. For anyone
+else, `GET` answers `404 not_found` and `DELETE` answers `{ "cancelled": false }`.
 
 #### `POST /v0/agents/:agentId/side-questions`
 
@@ -7806,9 +7810,9 @@ or once it has finished:
 - `response` — with `"answered"`: the answer as Markdown, or `null` when the harness produced
   none.
 - `synthetic` — with `"answered"`: `true` when the harness gave a canned reply in place of one the
-  model could not give.
+  model could not give, such as Claude Code's note that the model's API refused the request.
 - `error` — with `"failed"`: a human-readable English message saying why the harness gave no
-  answer, such as a rate limit.
+  answer, such as the harness stopping before it answered.
 
 Errors:
 
@@ -7816,7 +7820,7 @@ Errors:
 - `404 not_found` — no such agent.
 - `409 conflict` — another agent manages this agent and it is not a subtask, as for `send`.
 - `409 harness_not_running` — the harness has no conversation to answer from yet, as before the
-  agent's first turn on it or after a compaction until the next turn.
+  agent's first turn on it.
 - `501 unsupported` — the model the agent's mode selects answers no side questions.
 
 #### `GET /v0/agents/:agentId/side-questions/:sideQuestionId`

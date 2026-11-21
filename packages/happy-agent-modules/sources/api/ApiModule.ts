@@ -256,7 +256,7 @@ import {
 import { USER_MESSAGE_ORIGIN_METADATA } from "../impl/messageOrigin.js";
 import { mutationIdOf } from "../impl/mutationEcho.js";
 import { RunMutationOwners } from "./RunMutationOwners.js";
-import { ApiSideQuestions, type ApiSideQuestionState } from "./ApiSideQuestions.js";
+import { ApiSideQuestions } from "./ApiSideQuestions.js";
 import { decodeRequestProfile, requestProfilesForAgent } from "../impl/requestProfile.js";
 import {
     PermissionsModule,
@@ -5899,16 +5899,10 @@ export class ApiModule implements AgentModule {
             );
             if (!Value.Check(sideQuestionModeSchema, mode)) throw notRunning;
             const answering = detach(ctx).named("side-question");
-            // A client that leaves before the first answer never learns the question's id, so
-            // nobody could collect it: it is stopped.
-            let abandoned = false;
-            const onClose = (): void => {
-                if (!response.writableFinished) abandoned = true;
-            };
-            response.once("close", onClose);
-            let sideQuestion: ApiSideQuestionState;
-            try {
-                sideQuestion = await this.#sideQuestions.ask(agentId, owner, async (signal) => {
+            const sideQuestion = await this.#sideQuestions.ask(
+                agentId,
+                owner,
+                async (signal) => {
                     try {
                         const outcome = await this.#config.askSideQuestion(
                             answering,
@@ -5931,15 +5925,12 @@ export class ApiModule implements AgentModule {
                         }
                         throw error;
                     }
-                });
-            } finally {
-                response.off("close", onClose);
-            }
-            if (abandoned) {
-                this.#sideQuestions.cancel(agentId, owner, sideQuestion.id);
-                return true;
-            }
-            this.#sendSideQuestion(response, agentId, owner, sideQuestion);
+                },
+                response,
+            );
+            this.#sideQuestions.deliver(response, agentId, owner, sideQuestion, () =>
+                sendJson(response, 200, { sideQuestion }),
+            );
             return true;
         }
         if (request.method === "GET") {
@@ -5948,7 +5939,9 @@ export class ApiModule implements AgentModule {
             if (sideQuestion === undefined) {
                 throw notFound("The side question is no longer available. Ask it again.");
             }
-            this.#sendSideQuestion(response, agentId, owner, sideQuestion);
+            this.#sideQuestions.deliver(response, agentId, owner, sideQuestion, () =>
+                sendJson(response, 200, { sideQuestion }),
+            );
             return true;
         }
         if (request.method === "DELETE") {
@@ -5957,25 +5950,6 @@ export class ApiModule implements AgentModule {
             return true;
         }
         return false;
-    }
-
-    /**
-     * Answer with where a side question stands. One that ended is forgotten only once the response
-     * carrying its end has been sent in full, so a response whose connection failed leaves it for
-     * the next request.
-     */
-    #sendSideQuestion(
-        response: ServerResponse,
-        agentId: string,
-        owner: string | undefined,
-        sideQuestion: ApiSideQuestionState,
-    ): void {
-        if (sideQuestion.status !== "answering") {
-            response.once("finish", () =>
-                this.#sideQuestions.collected(agentId, owner, sideQuestion.id),
-            );
-        }
-        sendJson(response, 200, { sideQuestion });
     }
 
     /**

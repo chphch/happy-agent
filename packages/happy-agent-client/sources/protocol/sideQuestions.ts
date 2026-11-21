@@ -25,7 +25,7 @@ export const askSideQuestionRequestSchema = Type.Object(
     { additionalProperties: false },
 );
 
-/** A side question as one response reports it; it is gone once `answered` or `failed`. */
+/** A side question as one response reports it; gone once a response carrying its end is sent. */
 export const sideQuestionSchema = Type.Union([
     Type.Object({ id: Type.String({ minLength: 1 }), status: Type.Literal("answering") }),
     Type.Object({
