@@ -5887,7 +5887,9 @@ export class ApiModule implements AgentModule {
         const owner = teamUser(ctx)?.id;
         if (id === undefined) {
             if (request.method !== "POST") return false;
-            await this.#assertUserControlledAgent(ctx, agentId);
+            // Asking changes nothing about the agent, so an archived one is asked too and stays
+            // archived.
+            await this.#assertUserControlledAgent(ctx, agentId, true);
             const body = await bodyAs(request, sideQuestionBodySchema, "side question");
             const mode = await this.#agentMode(ctx, agentId);
             const notRunning = new ApiError(

@@ -7764,7 +7764,7 @@ side thread: a client that shows one sends the earlier exchanges with each new q
 #### `POST /v0/agents/:agentId/side-questions`
 
 Asks a side question and waits up to 20 seconds for its answer. It needs the same access as
-sending the agent a message.
+sending the agent a message, except that an archived agent is asked too and stays archived.
 
 Request:
 
