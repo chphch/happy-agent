@@ -22,6 +22,13 @@ export type ApiSideQuestionState =
       }
     | { readonly id: string; readonly status: "failed"; readonly error: string };
 
+/** What side questions need of the response a request is answered with. */
+export interface ApiSideQuestionResponse {
+    readonly writableFinished: boolean;
+    once(event: "close" | "finish", listener: () => void): unknown;
+    off(event: "close", listener: () => void): unknown;
+}
+
 type Outcome =
     | { readonly answer: AcpSideQuestionAnswer }
     | { readonly refusal: ApiError }
@@ -41,10 +48,11 @@ interface Question {
  *
  * Answering can take longer than one request may wait, so a question is asked once and collected
  * with as many requests as it needs, each waiting at most 20 seconds. A question is forgotten once
- * a response carrying its answer or failure has been sent in full (`collected`), when it is
+ * a response carrying its answer or failure has been sent in full (`deliver`), when it is
  * cancelled, and when nobody has collected it within 10 minutes of being asked, which also stops
- * its answer. A response whose connection failed leaves the answer for the next request. So only
- * the questions of the last ten minutes are held, and only in memory: they end with the daemon.
+ * its answer. A response whose connection failed leaves the answer for the next request, and a
+ * question whose asker left before learning its id is stopped at once. So only the questions of
+ * the last ten minutes are held, and only in memory: they end with the daemon.
  */
 export class ApiSideQuestions {
     readonly #questions = new Map<string, Question>();
@@ -56,12 +64,15 @@ export class ApiSideQuestions {
 
     /**
      * Start answering with `answer`, which runs on beyond this request, and wait for it. An
-     * `ApiError` that `answer` throws refuses the question, and is thrown to the asker instead.
+     * `ApiError` that `answer` throws refuses the question, and is thrown to the asker instead. A
+     * client that disconnects from `response` before it is answered never learns the question's
+     * id, so nobody could collect it: the question is stopped at once.
      */
     async ask(
         agentId: string,
         owner: string | undefined,
         answer: (signal: AbortSignal) => Promise<AcpSideQuestionAnswer>,
+        response?: ApiSideQuestionResponse,
     ): Promise<ApiSideQuestionState> {
         const id = randomUUID();
         const controller = new AbortController();
@@ -73,7 +84,15 @@ export class ApiSideQuestions {
                 error instanceof ApiError ? { refusal: error } : { error: errorText(error) },
         );
         this.#questions.set(id, { agentId, owner, controller, outcome, expiry });
-        return (await this.#wait(id)) ?? { id, status: "failed", error: "It was stopped." };
+        const leave = (): void => {
+            if (response?.writableFinished === false) this.#forget(id, true);
+        };
+        response?.once("close", leave);
+        try {
+            return (await this.#wait(id)) ?? { id, status: "failed", error: "It was stopped." };
+        } finally {
+            response?.off("close", leave);
+        }
     }
 
     /** Wait again for a question asked earlier; `undefined` when it is gone or someone else's. */
@@ -93,9 +112,26 @@ export class ApiSideQuestions {
         return true;
     }
 
-    /** A response carrying the question's answer or failure was sent in full: forget it. */
-    collected(agentId: string, owner: string | undefined, id: string): void {
-        if (this.#find(agentId, owner, id) !== undefined) this.#forget(id, false);
+    /**
+     * Answer a request with where a side question stands, through `send`. One that ended is
+     * forgotten only once `response` has been sent in full, so a response whose connection fails
+     * leaves the answer for the next request.
+     */
+    deliver(
+        response: ApiSideQuestionResponse,
+        agentId: string,
+        owner: string | undefined,
+        sideQuestion: ApiSideQuestionState,
+        send: () => void,
+    ): void {
+        if (sideQuestion.status !== "answering") {
+            response.once("finish", () => {
+                if (this.#find(agentId, owner, sideQuestion.id) !== undefined) {
+                    this.#forget(sideQuestion.id, false);
+                }
+            });
+        }
+        send();
     }
 
     #find(agentId: string, owner: string | undefined, id: string): Question | undefined {

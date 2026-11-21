@@ -55,7 +55,7 @@ async function gymWithScriptedHarness(): Promise<AgentGym> {
     return gym;
 }
 
-it("serves side questions only to a harness that answers them, and keeps them out of the chat", async () => {
+it("refuses side questions a harness cannot answer, and keeps them out of the chat", async () => {
     const gym = await gymWithScriptedHarness();
     const path = `/v0/agents/${gym.defaultSessionId}/side-questions`;
 

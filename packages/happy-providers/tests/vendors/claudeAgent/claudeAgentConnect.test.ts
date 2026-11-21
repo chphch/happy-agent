@@ -276,12 +276,19 @@ it("runs Happy's approved tools without asking and marks an ask about another as
 const SIDE_MARK = "SIDE-QUESTION-7F3A";
 const SIDE_ANSWER = "SIDE-ANSWER-2C9E";
 
+/** A response the Messages API really sent, kept under `tests/vendors/fixtures/`. */
+interface RecordedResponse {
+    readonly status: number;
+    readonly headers: Record<string, string>;
+    readonly body: unknown;
+}
+
 /**
  * The Messages API answering a side question — any request carrying `SIDE_MARK` — with
- * `SIDE_ANSWER` at once, and any other request with "ok", held until `release` while `hold` is
- * set. Every request body is kept, in order.
+ * `SIDE_ANSWER` at once, or with `sideFailure` when given, and any other request with "ok", held
+ * until `release` while `hold` is set. Every request body is kept, in order.
  */
-async function sideQuestionMessagesApi() {
+async function sideQuestionMessagesApi(sideFailure?: RecordedResponse) {
     const bodies: string[] = [];
     const held: (() => void)[] = [];
     let hold = false;
@@ -295,6 +302,12 @@ async function sideQuestionMessagesApi() {
             }
             bodies.push(body);
             const side = body.includes(SIDE_MARK);
+            if (side && sideFailure !== undefined) {
+                response
+                    .writeHead(sideFailure.status, sideFailure.headers)
+                    .end(JSON.stringify(sideFailure.body));
+                return;
+            }
             const answer = (): void => {
                 const events = [
                     {
@@ -480,6 +493,26 @@ it("answers about a stored session in a separate Claude Code that neither contin
     expect(api.bodies.at(-1)).toContain("FIRST-PROMPT");
     expect(filesUnder(join(config, "projects"))).toEqual(stored);
     expect(hookRuns()).toBe(hooked);
+}, 120_000);
+
+it("answers a side question the Messages API refuses with Claude Code's canned reply saying so", async () => {
+    const recorded = JSON.parse(
+        readFileSync(
+            new URL("../fixtures/claude-usage-rate-limit-429.json", import.meta.url),
+            "utf8",
+        ),
+    ) as RecordedResponse;
+    const api = await sideQuestionMessagesApi(recorded);
+    const { connection, sessionId, ask } = await sideQuestionConnection(api);
+    await connection.conn.prompt({ sessionId, prompt: [{ type: "text", text: "FIRST-PROMPT" }] });
+
+    // Not a failure: Claude Code turns the refusal into a reply of its own, at once, which
+    // carries the API's message ("(API error: Request rejected (429)  Rate limited.)").
+    expect(await ask(`${SIDE_MARK} Anything?`)).toEqual({
+        response: expect.stringContaining("Rate limited."),
+        synthetic: true,
+    });
+    expect(api.bodies.filter((body) => body.includes(SIDE_MARK))).toHaveLength(1);
 }, 120_000);
 
 it("fails a side question about a session Claude Code does not have", async () => {

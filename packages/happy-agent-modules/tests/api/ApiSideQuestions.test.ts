@@ -1,13 +1,36 @@
+import { EventEmitter } from "node:events";
+import {
+    createServer,
+    request as httpRequest,
+    type IncomingMessage,
+    type Server,
+    type ServerResponse,
+} from "node:http";
+import type { AddressInfo } from "node:net";
+
 import { afterEach, expect, it, vi } from "vitest";
 
 import { ApiError } from "../../sources/api/ApiError.js";
-import { ApiSideQuestions } from "../../sources/api/ApiSideQuestions.js";
+import { ApiSideQuestions, type ApiSideQuestionState } from "../../sources/api/ApiSideQuestions.js";
 
-afterEach(() => {
+const servers: Server[] = [];
+afterEach(async () => {
     vi.useRealTimers();
+    await Promise.all(
+        servers.splice(0).map(
+            (server) =>
+                new Promise<void>((resolve) => {
+                    server.closeAllConnections();
+                    server.close(() => resolve());
+                }),
+        ),
+    );
 });
 
-/** An answer that comes only when `resolve` or `reject` is called, and notes its abort. */
+/**
+ * An answer that comes only when `resolve` or `reject` is called, and notes its abort. Stopped,
+ * it gives up, as a harness does.
+ */
 function pendingAnswer() {
     let resolve!: (answer: { response: string | null; synthetic: boolean }) => void;
     let reject!: (error: unknown) => void;
@@ -17,6 +40,7 @@ function pendingAnswer() {
         return new Promise<{ response: string | null; synthetic: boolean }>((ok, fail) => {
             resolve = ok;
             reject = fail;
+            signal.addEventListener("abort", () => fail(new Error("Stopped.")), { once: true });
         });
     };
     return {
@@ -25,6 +49,46 @@ function pendingAnswer() {
         resolve: (text: string) => resolve({ response: text, synthetic: false }),
         reject: (error: unknown) => reject(error),
     };
+}
+
+/** Hands `sideQuestion` to a request as a response that was sent in full. */
+function sendInFull(
+    questions: ApiSideQuestions,
+    agentId: string,
+    owner: string | undefined,
+    sideQuestion: ApiSideQuestionState,
+): void {
+    const response = Object.assign(new EventEmitter(), { writableFinished: false });
+    questions.deliver(response, agentId, owner, sideQuestion, () => response.emit("finish"));
+}
+
+/** A local HTTP server whose requests `handle` answers; its port. */
+async function serve(
+    handle: (request: IncomingMessage, response: ServerResponse) => Promise<void>,
+): Promise<number> {
+    const server = createServer((request, response) => {
+        void handle(request, response);
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    return (server.address() as AddressInfo).port;
+}
+
+/** A request to `port`: its whole response once it arrives, and a way to drop its connection. */
+function call(port: number, method: "POST" | "GET") {
+    const request = httpRequest({ host: "127.0.0.1", port, method });
+    // A dropped connection is the point of some tests, not a failure.
+    request.on("error", () => undefined);
+    const response = new Promise<{ status: number; body: string }>((resolve) => {
+        request.on("response", (incoming) => {
+            let body = "";
+            incoming.setEncoding("utf8");
+            incoming.on("data", (chunk: string) => (body += chunk));
+            incoming.on("end", () => resolve({ status: incoming.statusCode ?? 0, body }));
+        });
+    });
+    request.end();
+    return { response, drop: () => request.destroy() };
 }
 
 it("answers at once when the answer comes within the wait, and keeps it until it is collected", async () => {
@@ -44,11 +108,11 @@ it("answers at once when the answer comes within the wait, and keeps it until it
     // The response carrying it may never arrive, so the next request gets the answer again.
     expect(await questions.wait("agent-1", undefined, state.id)).toEqual(state);
     // Someone else's collecting changes nothing.
-    questions.collected("agent-1", "user-2", state.id);
-    questions.collected("agent-2", undefined, state.id);
+    sendInFull(questions, "agent-1", "user-2", state);
+    sendInFull(questions, "agent-2", undefined, state);
     expect(await questions.wait("agent-1", undefined, state.id)).toEqual(state);
 
-    questions.collected("agent-1", undefined, state.id);
+    sendInFull(questions, "agent-1", undefined, state);
     expect(await questions.wait("agent-1", undefined, state.id)).toBeUndefined();
 });
 
@@ -86,7 +150,7 @@ it("reports a harness failure as a failed question, and refuses with the error i
         error: "Rate limited until 3 pm.",
     });
     expect(await questions.wait("agent-1", undefined, failed.id)).toEqual(failed);
-    questions.collected("agent-1", undefined, failed.id);
+    sendInFull(questions, "agent-1", undefined, failed);
     expect(await questions.wait("agent-1", undefined, failed.id)).toBeUndefined();
 
     const refusal = new ApiError(409, "harness_not_running", "There is no conversation yet.");
@@ -147,4 +211,64 @@ it("stops and forgets a question nobody collects within ten minutes", async () =
 
     expect(pending.state.signal?.aborted).toBe(true);
     expect(await questions.wait("agent-1", undefined, id)).toBeUndefined();
+});
+
+it("stops a question at once when its asker leaves before learning its id", async () => {
+    const questions = new ApiSideQuestions({ waitMs: 60_000 });
+    const pending = pendingAnswer();
+    const port = await serve(async (_request, response) => {
+        const sideQuestion = await questions.ask("agent-1", undefined, pending.answer, response);
+        questions.deliver(response, "agent-1", undefined, sideQuestion, () =>
+            response.end(JSON.stringify(sideQuestion)),
+        );
+    });
+
+    const asking = call(port, "POST");
+    await vi.waitFor(() => expect(pending.state.signal).toBeDefined());
+    asking.drop();
+
+    // At once, not after the 60 seconds the request would wait.
+    await vi.waitFor(() => expect(pending.state.signal?.aborted).toBe(true));
+});
+
+it("keeps an answer whose response lost its connection for the next request, and forgets it once one arrives", async () => {
+    const questions = new ApiSideQuestions({ waitMs: 2_000 });
+    const pending = pendingAnswer();
+    const { id } = await questions.ask("agent-1", undefined, pending.answer);
+    const waits: ApiSideQuestionState["status"][] = [];
+    let waiting = 0;
+    let closed = 0;
+    const port = await serve(async (_request, response) => {
+        response.once("close", () => (closed += response.writableFinished ? 0 : 1));
+        waiting++;
+        const sideQuestion = await questions.wait("agent-1", undefined, id);
+        if (sideQuestion === undefined) {
+            response.writeHead(404).end();
+            return;
+        }
+        waits.push(sideQuestion.status);
+        questions.deliver(response, "agent-1", undefined, sideQuestion, () =>
+            response.end(JSON.stringify(sideQuestion)),
+        );
+    });
+
+    // The connection drops while the request waits; then the answer comes.
+    const lost = call(port, "GET");
+    await vi.waitFor(() => expect(waiting).toBe(1), { interval: 5 });
+    lost.drop();
+    await vi.waitFor(() => expect(closed).toBe(1), { interval: 5 });
+    pending.resolve("The parser.");
+    await vi.waitFor(() => expect(waits).toEqual(["answered"]));
+
+    // Sent to nobody, so the next request still gets it.
+    const next = await call(port, "GET").response;
+    expect(next.status).toBe(200);
+    expect(JSON.parse(next.body)).toEqual({
+        id,
+        status: "answered",
+        response: "The parser.",
+        synthetic: false,
+    });
+    // That one arrived, so the question is gone.
+    await vi.waitFor(async () => expect((await call(port, "GET").response).status).toBe(404));
 });

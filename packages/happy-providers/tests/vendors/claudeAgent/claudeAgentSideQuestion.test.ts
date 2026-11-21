@@ -334,32 +334,22 @@ it("asks about the foreign session stored for a Happy session, and nothing witho
     expect(sdk.state.options).toHaveLength(1);
 }, 30_000);
 
-it.each([
-    [
-        'API Error: 429 {"type":"error","error":{"type":"rate_limit_error"}}',
-        "Claude Code hit a usage limit. Try again once it resets.",
-    ],
-    ["API Error: 529 Overloaded", "Claude is overloaded right now. Try again in a moment."],
-    ["Invalid API key · Please run /login", "Claude Code isn't signed in, or its sign-in expired."],
-    [
+it("says Claude Code could not answer without repeating its own words", async () => {
+    const { connection, sessionId } = await connect();
+    const failure = new Error(
         "ENOENT: no such file or directory, open '/home/alex/.config/secret'",
-        "Claude Code could not answer this side question.",
-    ],
-])(
-    "says why Claude Code gave no answer without repeating its words: %s",
-    async (said, shown) => {
-        const { connection, sessionId } = await connect();
-        const failure = new Error(said);
-        sdk.state.answer = () => {
-            throw failure;
-        };
+    );
+    sdk.state.answer = () => {
+        throw failure;
+    };
 
-        await expect(
-            connection.conn.askSideQuestion?.({ sessionId, ...sideQuestion("Anything?") }),
-        ).rejects.toMatchObject({ message: shown, cause: failure });
-    },
-    30_000,
-);
+    await expect(
+        connection.conn.askSideQuestion?.({ sessionId, ...sideQuestion("Anything?") }),
+    ).rejects.toMatchObject({
+        message: "Claude Code could not answer this side question.",
+        cause: failure,
+    });
+}, 30_000);
 
 it("says when the separate Claude Code no longer has the stored conversation", async () => {
     const directory = mkdtempSync(join(tmpdir(), "claude-stored-side-question-gone-"));
