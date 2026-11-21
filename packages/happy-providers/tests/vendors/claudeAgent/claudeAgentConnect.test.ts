@@ -495,5 +495,5 @@ it("fails a side question about a session Claude Code does not have", async () =
             signal: new AbortController().signal,
             options: [],
         }),
-    ).rejects.toThrow();
+    ).rejects.toThrow("Claude Code no longer has this conversation.");
 }, 120_000);

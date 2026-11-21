@@ -19,8 +19,10 @@ import { claudeCodeAgent } from "@/vendors/foreignAgents/claudeCodeAgent.js";
 
 /**
  * A Claude Code stream that answers each prompt, at once or, with `hold`, once `release` is
- * called, and answers every side question with what `answer` returns. It records every message
- * handed to Claude Code, every side question, every control call, and every query's options.
+ * called, and answers every side question with what `answer` returns, after writing `stderr` to
+ * its error output. With `starting`, setting the model waits until the query is closed, as while
+ * Claude Code is still starting. It records every message handed to Claude Code, every side
+ * question, every control call, and every query's options.
  */
 const sdk = vi.hoisted(() => {
     const answer = (question: string): { response: string | null; synthetic?: boolean } | null => ({
@@ -30,6 +32,8 @@ const sdk = vi.hoisted(() => {
         hold: false,
         release: (): void => undefined,
         answer,
+        starting: false,
+        stderr: "",
         inputs: [] as string[],
         asked: [] as { question: string; history: unknown; signal: unknown }[],
         options: [] as Record<string, unknown>[],
@@ -48,6 +52,7 @@ const sdk = vi.hoisted(() => {
     }) {
         state.options.push(params.options);
         const prompts: string[] = [];
+        const closing: (() => void)[] = [];
         let arrived: (() => void) | undefined;
         void (async () => {
             for await (const message of params.prompt) {
@@ -72,6 +77,10 @@ const sdk = vi.hoisted(() => {
             supportedModels: async () => [],
             setModel: async (model: string) => {
                 state.calls.push(`setModel ${model}`);
+                if (!state.starting) return;
+                await new Promise<void>((_, reject) => {
+                    closing.push(() => reject(new Error("Query closed before response received")));
+                });
             },
             applyFlagSettings: async (settings: Record<string, unknown>) => {
                 state.calls.push(`applyFlagSettings ${JSON.stringify(settings)}`);
@@ -84,10 +93,14 @@ const sdk = vi.hoisted(() => {
             ) => {
                 state.calls.push(`askSideQuestion ${question}`);
                 state.asked.push({ question, history: options.history, signal: options.signal });
+                if (state.stderr !== "") {
+                    (params.options["stderr"] as (data: string) => void)(state.stderr);
+                }
                 return state.answer(question);
             },
             close: () => {
                 state.closed++;
+                for (const reject of closing.splice(0)) reject();
             },
         });
     }
@@ -103,6 +116,8 @@ afterEach(() => {
     for (const session of sessions.splice(0)) session.destroy();
     sdk.state.hold = false;
     sdk.state.answer = sdk.answer;
+    sdk.state.starting = false;
+    sdk.state.stderr = "";
     sdk.state.closed = 0;
     for (const list of [sdk.state.inputs, sdk.state.asked, sdk.state.options, sdk.state.calls]) {
         list.splice(0);
@@ -318,3 +333,96 @@ it("asks about the foreign session stored for a Happy session, and nothing witho
     ).toBeUndefined();
     expect(sdk.state.options).toHaveLength(1);
 }, 30_000);
+
+it.each([
+    [
+        'API Error: 429 {"type":"error","error":{"type":"rate_limit_error"}}',
+        "Claude Code hit a usage limit. Try again once it resets.",
+    ],
+    ["API Error: 529 Overloaded", "Claude is overloaded right now. Try again in a moment."],
+    ["Invalid API key · Please run /login", "Claude Code isn't signed in, or its sign-in expired."],
+    [
+        "ENOENT: no such file or directory, open '/home/alex/.config/secret'",
+        "Claude Code could not answer this side question.",
+    ],
+])(
+    "says why Claude Code gave no answer without repeating its words: %s",
+    async (said, shown) => {
+        const { connection, sessionId } = await connect();
+        const failure = new Error(said);
+        sdk.state.answer = () => {
+            throw failure;
+        };
+
+        await expect(
+            connection.conn.askSideQuestion?.({ sessionId, ...sideQuestion("Anything?") }),
+        ).rejects.toMatchObject({ message: shown, cause: failure });
+    },
+    30_000,
+);
+
+it("says when the separate Claude Code no longer has the stored conversation", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "claude-stored-side-question-gone-"));
+    const stored = (question: string) =>
+        claudeAgentStoredSideQuestion(
+            { CLAUDE_CONFIG_DIR: join(directory, "config") },
+            { ...sideQuestion(question), sessionId: "stored-session", cwd: directory, options: [] },
+        );
+    sdk.state.answer = () => {
+        throw new Error("Claude Code process exited with code 1");
+    };
+
+    sdk.state.stderr = "No conversation found with session ID: stored-session\n";
+    await expect(stored("Anything?")).rejects.toThrow(
+        "Claude Code no longer has this conversation.",
+    );
+    sdk.state.stderr = "";
+    await expect(stored("Anything else?")).rejects.toThrow(
+        "Claude Code stopped before it answered.",
+    );
+}, 30_000);
+
+it("ends the separate Claude Code as soon as the side question is stopped, also while it starts", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "claude-stored-side-question-stop-"));
+    sdk.state.starting = true;
+    const controller = new AbortController();
+    const asking = claudeAgentStoredSideQuestion(
+        { CLAUDE_CONFIG_DIR: join(directory, "config") },
+        {
+            question: "Anything?",
+            history: [],
+            signal: controller.signal,
+            sessionId: "stored-session",
+            cwd: directory,
+            options: [{ configId: "model", value: "opus" }],
+        },
+    );
+    await vi.waitFor(() => expect(sdk.state.calls).toEqual(["setModel opus"]));
+
+    controller.abort();
+
+    // Stopped on purpose, so the failure is not turned into a reason for a person.
+    await expect(asking).rejects.toThrow("Query closed before response received");
+    expect(sdk.state.closed).toBeGreaterThan(0);
+    expect(sdk.state.asked).toEqual([]);
+}, 30_000);
+
+it("starts no Claude Code for a side question stopped before it is asked", async () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+        claudeAgentStoredSideQuestion(
+            {},
+            {
+                question: "Anything?",
+                history: [],
+                signal: controller.signal,
+                sessionId: "stored-session",
+                cwd: tmpdir(),
+                options: [],
+            },
+        ),
+    ).rejects.toThrow("The side question was stopped.");
+    expect(sdk.state.options).toEqual([]);
+});
