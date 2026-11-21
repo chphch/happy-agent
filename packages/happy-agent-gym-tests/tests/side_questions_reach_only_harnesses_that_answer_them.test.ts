@@ -104,5 +104,13 @@ it("serves side questions only to a harness that answers them, and keeps them ou
 
     // None of it reached the conversation.
     expect(await gym.history()).toEqual(before);
+
+    // An archived agent is asked too, and asking leaves it archived.
+    await gym.client.archiveAgent(gym.defaultSessionId);
+    const archived = await gym.http.post(path, { question: "What did you start?" });
+    expect(archived.status).toBe(501);
+    expect((await gym.client.getAgent(gym.defaultSessionId)).agent.archivedAt).toEqual(
+        expect.any(Number),
+    );
     expect(gym.errors).toEqual([]);
 }, 60_000);
