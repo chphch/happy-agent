@@ -256,7 +256,7 @@ import {
 import { USER_MESSAGE_ORIGIN_METADATA } from "../impl/messageOrigin.js";
 import { mutationIdOf } from "../impl/mutationEcho.js";
 import { RunMutationOwners } from "./RunMutationOwners.js";
-import { ApiSideQuestions } from "./ApiSideQuestions.js";
+import { ApiSideQuestions, type ApiSideQuestionState } from "./ApiSideQuestions.js";
 import { decodeRequestProfile, requestProfilesForAgent } from "../impl/requestProfile.js";
 import {
     PermissionsModule,
@@ -5899,36 +5899,83 @@ export class ApiModule implements AgentModule {
             );
             if (!Value.Check(sideQuestionModeSchema, mode)) throw notRunning;
             const answering = detach(ctx).named("side-question");
-            const sideQuestion = await this.#sideQuestions.ask(agentId, owner, async (signal) => {
-                const outcome = await this.#config.askSideQuestion(answering, agentId, mode, {
-                    question: body.question,
-                    history: body.history ?? [],
-                    signal,
+            // A client that leaves before the first answer never learns the question's id, so
+            // nobody could collect it: it is stopped.
+            let abandoned = false;
+            const onClose = (): void => {
+                if (!response.writableFinished) abandoned = true;
+            };
+            response.once("close", onClose);
+            let sideQuestion: ApiSideQuestionState;
+            try {
+                sideQuestion = await this.#sideQuestions.ask(agentId, owner, async (signal) => {
+                    try {
+                        const outcome = await this.#config.askSideQuestion(
+                            answering,
+                            agentId,
+                            mode,
+                            { question: body.question, history: body.history ?? [], signal },
+                        );
+                        if (outcome.status === "unsupported") {
+                            throw unsupported("This chat's model can't answer side questions.");
+                        }
+                        if (outcome.status === "harness_not_running") throw notRunning;
+                        return outcome.answer;
+                    } catch (error) {
+                        // The harness's own words go to the log; a person sees the error's message.
+                        if (!(error instanceof ApiError) && !signal.aborted) {
+                            const cause = error instanceof Error ? (error.cause ?? error) : error;
+                            answering.log.warn(
+                                `A side question for agent ${agentId} failed: ${String(cause)}`,
+                            );
+                        }
+                        throw error;
+                    }
                 });
-                if (outcome.status === "unsupported") {
-                    throw unsupported("This chat's model can't answer side questions.");
-                }
-                if (outcome.status === "harness_not_running") throw notRunning;
-                return outcome.answer;
-            });
-            sendJson(response, 200, { sideQuestion });
+            } finally {
+                response.off("close", onClose);
+            }
+            if (abandoned) {
+                this.#sideQuestions.cancel(agentId, owner, sideQuestion.id);
+                return true;
+            }
+            this.#sendSideQuestion(response, agentId, owner, sideQuestion);
             return true;
         }
         if (request.method === "GET") {
-            await this.#requireAgentResource(ctx, agentId);
+            await this.#assertUserControlledAgent(ctx, agentId, true);
             const sideQuestion = await this.#sideQuestions.wait(agentId, owner, id);
             if (sideQuestion === undefined) {
                 throw notFound("The side question is no longer available. Ask it again.");
             }
-            sendJson(response, 200, { sideQuestion });
+            this.#sendSideQuestion(response, agentId, owner, sideQuestion);
             return true;
         }
         if (request.method === "DELETE") {
-            await this.#requireAgentResource(ctx, agentId);
+            await this.#assertUserControlledAgent(ctx, agentId, true);
             sendJson(response, 200, { cancelled: this.#sideQuestions.cancel(agentId, owner, id) });
             return true;
         }
         return false;
+    }
+
+    /**
+     * Answer with where a side question stands. One that ended is forgotten only once the response
+     * carrying its end has been sent in full, so a response whose connection failed leaves it for
+     * the next request.
+     */
+    #sendSideQuestion(
+        response: ServerResponse,
+        agentId: string,
+        owner: string | undefined,
+        sideQuestion: ApiSideQuestionState,
+    ): void {
+        if (sideQuestion.status !== "answering") {
+            response.once("finish", () =>
+                this.#sideQuestions.collected(agentId, owner, sideQuestion.id),
+            );
+        }
+        sendJson(response, 200, { sideQuestion });
     }
 
     /**

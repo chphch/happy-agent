@@ -27,7 +27,7 @@ function pendingAnswer() {
     };
 }
 
-it("answers at once when the answer comes within the wait", async () => {
+it("answers at once when the answer comes within the wait, and keeps it until it is collected", async () => {
     const questions = new ApiSideQuestions({ waitMs: 1_000 });
 
     const state = await questions.ask("agent-1", undefined, async () => ({
@@ -41,7 +41,14 @@ it("answers at once when the answer comes within the wait", async () => {
         response: "The parser.",
         synthetic: false,
     });
-    // Collected: the question is gone.
+    // The response carrying it may never arrive, so the next request gets the answer again.
+    expect(await questions.wait("agent-1", undefined, state.id)).toEqual(state);
+    // Someone else's collecting changes nothing.
+    questions.collected("agent-1", "user-2", state.id);
+    questions.collected("agent-2", undefined, state.id);
+    expect(await questions.wait("agent-1", undefined, state.id)).toEqual(state);
+
+    questions.collected("agent-1", undefined, state.id);
     expect(await questions.wait("agent-1", undefined, state.id)).toBeUndefined();
 });
 
@@ -70,11 +77,17 @@ it("reports a question still being answered, and hands its answer to the next wa
 it("reports a harness failure as a failed question, and refuses with the error it was refused with", async () => {
     const questions = new ApiSideQuestions({ waitMs: 1_000 });
 
-    expect(
-        await questions.ask("agent-1", undefined, async () => {
-            throw new Error("Rate limited until 3 pm.");
-        }),
-    ).toEqual({ id: expect.any(String), status: "failed", error: "Rate limited until 3 pm." });
+    const failed = await questions.ask("agent-1", undefined, async () => {
+        throw new Error("Rate limited until 3 pm.");
+    });
+    expect(failed).toEqual({
+        id: expect.any(String),
+        status: "failed",
+        error: "Rate limited until 3 pm.",
+    });
+    expect(await questions.wait("agent-1", undefined, failed.id)).toEqual(failed);
+    questions.collected("agent-1", undefined, failed.id);
+    expect(await questions.wait("agent-1", undefined, failed.id)).toBeUndefined();
 
     const refusal = new ApiError(409, "harness_not_running", "There is no conversation yet.");
     await expect(
@@ -95,6 +108,18 @@ it("stops answering a cancelled question and forgets it", async () => {
     expect(await questions.wait("agent-1", undefined, id)).toBeUndefined();
     // An answer arriving after all goes nowhere.
     pending.resolve("Too late.");
+});
+
+it("ends a wait with nothing when its question is cancelled meanwhile", async () => {
+    const questions = new ApiSideQuestions({ waitMs: 20 });
+    const pending = pendingAnswer();
+    const { id } = await questions.ask("agent-1", undefined, pending.answer);
+
+    const waiting = questions.wait("agent-1", undefined, id);
+    questions.cancel("agent-1", undefined, id);
+
+    // Not "answering": a client polling on would never be answered.
+    expect(await waiting).toBeUndefined();
 });
 
 it("keeps a question to the agent and the person who asked it", async () => {
