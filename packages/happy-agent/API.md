@@ -8099,7 +8099,9 @@ side thread: a client that shows one sends the earlier exchanges with each new q
 #### `POST /v0/agents/:agentId/side-questions`
 
 Asks a side question and waits up to 20 seconds for its answer. It needs the same access as
-sending the agent a message, except that an archived agent is asked too and stays archived.
+sending the agent a message, except that an archived agent is asked too and stays archived. A
+client that disconnects before this response arrives never learns the side question's `id`, so the
+daemon stops answering it.
 
 Request:
 
@@ -8145,22 +8147,26 @@ or once it has finished:
 
 Errors:
 
+- `400 invalid_request` — the body is not the request above.
 - `404 not_found` — no such agent.
-- `501 unsupported` — the model the agent's mode selects answers no side questions.
+- `409 conflict` — another agent manages this agent and it is not a subtask, as for `send`.
 - `409 harness_not_running` — the harness has no conversation to answer from yet, as before the
   agent's first turn on it or after a compaction until the next turn.
+- `501 unsupported` — the model the agent's mode selects answers no side questions.
 
 #### `GET /v0/agents/:agentId/side-questions/:sideQuestionId`
 
-Waits up to 20 seconds more for the side question. The response is exactly that of the `POST`.
-Once a response carries `"answered"` or `"failed"`, the side question is gone. A side question
-that is gone, cancelled, or still uncollected 10 minutes after it was asked is `404 not_found`;
-the daemon stops answering one that nobody collects within those 10 minutes.
+Waits up to 20 seconds more for the side question. It needs the same access as the `POST`, and its
+response is exactly that of the `POST`. Once a response carrying `"answered"` or `"failed"` has
+been sent in full, the side question is gone; when the connection fails before that, the side
+question stays for the next `GET`. A side question that is gone, cancelled, or still uncollected
+10 minutes after it was asked is `404 not_found`; the daemon stops answering one that nobody
+collects within those 10 minutes.
 
 #### `DELETE /v0/agents/:agentId/side-questions/:sideQuestionId`
 
-Stops answering the side question and forgets it. Response — `200`: `{ "cancelled": true }` —
-`false` when it was already gone.
+Stops answering the side question and forgets it. It needs the same access as the `POST`.
+Response — `200`: `{ "cancelled": true }` — `false` when it was already gone.
 
 ### Messages and runs
 
