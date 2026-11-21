@@ -6,6 +6,7 @@ import {
     AcpProvider,
     foreignAgent,
     type AcpPermissionQuestion,
+    type AcpSession,
     type AcpTurnEnvironment,
     type ForeignAgent,
     type ForeignAgentStart,
@@ -124,9 +125,10 @@ export function happyHarnessAccepts(
  * system asks and that mode leaves open is decided through `askPermission`, and a turn it starts
  * on its own, such as after a background command finished, runs the agent again through `wake` so
  * that turn is shown. How many background tasks it keeps running after its turns, such as Claude
- * Code's background commands and subagents, goes to `reportBackgroundWork`. Its session
- * records live in a private directory per harness and account, so two accounts never continue
- * each other's foreign sessions.
+ * Code's background commands and subagents, goes to `reportBackgroundWork`. Every session the
+ * provider opens goes to `trackSession`, which returns what to run once it is destroyed, so a side
+ * question can reach the agent's live foreign session. Its session records live in a private
+ * directory per harness and account, so two accounts never continue each other's foreign sessions.
  */
 export function createForeignAgentProvider(
     route: ForeignAgentRoute,
@@ -135,14 +137,20 @@ export function createForeignAgentProvider(
     askPermission?: ForeignAgentPermissionAsker,
     wake?: ForeignAgentWaker,
     reportBackgroundWork?: ForeignAgentBackgroundWorkReporter,
+    trackSession?: ForeignAgentSessionTracker,
 ): AcpProvider {
     const directory = foreignAgentDirectory(agentHome, route);
+    const start = {
+        ...foreignAgentStart(route),
+        // The agent names a reading after its vendor; it belongs to the account it ran on.
+        onAccountUsage: (usage: ProviderUsage) =>
+            onAccountUsage?.({ ...usage, providerId: route.providerId }),
+    };
+    const askStoredSideQuestion = route.agent.askStoredSideQuestion?.(start);
     return new AcpProvider({
-        connect: route.agent.connect({
-            ...foreignAgentStart(route),
-            // The agent names a reading after its vendor; it belongs to the account it ran on.
-            onAccountUsage: (usage) => onAccountUsage?.({ ...usage, providerId: route.providerId }),
-        }),
+        connect: route.agent.connect(start),
+        ...(askStoredSideQuestion === undefined ? {} : { askStoredSideQuestion }),
+        ...(trackSession === undefined ? {} : { onSession: trackSession }),
         stateDirectory: directory,
         environment: (ctx) => ({
             ...foreignAgentTurnEnvironment(ctx, directory),
@@ -209,6 +217,12 @@ export type ForeignAgentWaker = (ctx: Context, notice: SessionSystemMessage) => 
  * after its turns, reported again on every change and as 0 once that work is gone.
  */
 export type ForeignAgentBackgroundWorkReporter = (ctx: Context, running: number) => void;
+
+/**
+ * Takes each session a foreign agent provider opens, as soon as it exists, and returns what to run
+ * once it is destroyed.
+ */
+export type ForeignAgentSessionTracker = (session: AcpSession) => (() => void) | undefined;
 
 /** The private directory one route keeps its state in. */
 export function foreignAgentDirectory(agentHome: string, route: ForeignAgentRoute): string {

@@ -175,6 +175,8 @@ A foreign agent may also start a turn on its own, as Claude Code does when a bac
 
 Such a foreign agent may also keep work running after its turn ends — Claude Code's background commands, monitors, subagents and workflows. Each time the number of those tasks changes, the route's turn environment reports it, and config passes the agent it runs as and the new count to whatever module registered with `onForeignAgentBackgroundWork`: the API module, which counts the tasks among the agent's running background processes.
 
+`askSideQuestion` asks the harness running an agent's conversation a side question about it (Claude Code's `/btw`) without adding to the conversation. Config keeps the foreign session each provider opens for an agent, held weakly until it is destroyed, and asks that session when there is one, during a turn as much as between turns. Otherwise the route's foreign agent answers from the agent's stored session record in a separate process that leaves the session unchanged. `answersSideQuestions` says which provider/model routes can answer: those whose foreign agent offers `askStoredSideQuestion`.
+
 An agent on any harness may start sub-agents and subtasks on every enabled harness; there is no
 per-harness reach setting. `harnessUsage` reads Antigravity's quota from `agy -p /usage` (`impl/harnessUsage.ts`), at most
 every five minutes per account, for `agent_options({ usage: true })` to show.

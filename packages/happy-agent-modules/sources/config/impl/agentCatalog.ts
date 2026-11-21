@@ -41,6 +41,7 @@ import {
     type ForeignAgentBackgroundWorkReporter,
     type ForeignAgentConfiguredProvider,
     type ForeignAgentPermissionAsker,
+    type ForeignAgentSessionTracker,
     type ForeignAgentWaker,
 } from "./createForeignAgentProvider.js";
 import { foreignAgentModels } from "./foreignAgentModels.js";
@@ -614,6 +615,7 @@ export function agentProviders(
     readConfiguration: () => HappyAgentConfiguration = () => configuration,
     wakeForeignAgent?: ForeignAgentWaker,
     reportForeignBackgroundWork?: ForeignAgentBackgroundWorkReporter,
+    trackForeignSession?: ForeignAgentSessionTracker,
 ): AgentProviders {
     const providers = new AgentProviders();
     const retryLimit = configuration.values.settings.inferenceMaxRetries;
@@ -674,6 +676,7 @@ export function agentProviders(
                                   askHarnessPermission,
                                   wakeForeignAgent,
                                   reportForeignBackgroundWork,
+                                  trackForeignSession,
                               )
                             : await createProvider(
                                   id,
